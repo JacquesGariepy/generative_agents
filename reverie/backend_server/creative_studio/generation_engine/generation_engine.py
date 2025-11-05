@@ -1,8 +1,13 @@
 """
-Main Generation Engine - Orchestrates All Generation Capabilities
+Main Generation Engine - Unified with LiteLLM
 
-This is the main entry point for all image/video generation.
-Ensures artifact-free output through multi-stage pipeline.
+NOW USES LITELLM FOR ALL IMAGE GENERATION:
+- No more direct diffusers imports
+- No more direct OpenAI imports
+- Unified API for all providers
+- Local and cloud models supported
+
+This ensures consistency across the entire system.
 """
 
 from typing import Optional, Dict, Any, Tuple, List
@@ -10,22 +15,39 @@ from PIL import Image
 import numpy as np
 from dataclasses import dataclass
 import logging
+import io
+import base64
+import requests
 
-# Import canvas awareness for boundary checking
+# Import LiteLLM integration
 import sys
 import os
-sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
+try:
+    from litellm_integration import get_litellm_manager
+    LITELLM_AVAILABLE = True
+except ImportError:
+    try:
+        from ...litellm_integration import get_litellm_manager
+        LITELLM_AVAILABLE = True
+    except ImportError:
+        LITELLM_AVAILABLE = False
+
+# Import canvas awareness for boundary checking
 try:
     from canvas_awareness import BoundaryIntelligence
 except:
-    from ..canvas_awareness import BoundaryIntelligence
+    try:
+        from ..canvas_awareness import BoundaryIntelligence
+    except:
+        BoundaryIntelligence = None
 
 
 @dataclass
 class GenerationConfig:
     """Configuration for image generation"""
-    model: str  # "flux", "sd3.5", "dalle3", "midjourney"
+    model: str  # "flux", "sd3.5", "dalle3", "ollama_sd", etc.
     prompt: str
     negative_prompt: str = ""
     width: int = 1024
@@ -37,6 +59,7 @@ class GenerationConfig:
     control_image: Optional[Image.Image] = None
     style_reference: Optional[Image.Image] = None
     quality_mode: str = "high"  # "draft", "normal", "high", "maximum"
+    litellm_config_name: Optional[str] = None  # Override LiteLLM config
 
 
 @dataclass
@@ -55,33 +78,41 @@ class GenerationEngine:
     """
     Main generation engine with artifact-free guarantee.
 
-    Features:
-    - Multi-model support
+    NOW FULLY INTEGRATED WITH LITELLM:
+    - Uses LiteLLM for all image generation
+    - Supports 100+ providers
+    - Local and cloud models
     - Automatic quality assurance
-    - Boundary intelligence integration
     - Perfect compositing
     """
 
-    def __init__(self, api_keys: Optional[Dict[str, str]] = None):
+    def __init__(self, litellm_manager=None):
         """
-        Initialize generation engine.
+        Initialize generation engine with LiteLLM.
 
         Args:
-            api_keys: Dictionary of API keys for various services
-                      {'openai': '...', 'replicate': '...', etc.}
+            litellm_manager: LiteLLM manager instance (or create default)
         """
-        self.api_keys = api_keys or {}
-        self.boundary_intelligence = BoundaryIntelligence()
+        self.logger = logging.getLogger(__name__)
 
-        # Initialize model clients (lazy loading)
-        self._model_clients = {}
+        # Initialize LiteLLM
+        if LITELLM_AVAILABLE:
+            self.litellm = litellm_manager or get_litellm_manager()
+            self.logger.info("Generation Engine initialized with LiteLLM")
+        else:
+            self.litellm = None
+            self.logger.warning("LiteLLM not available - image generation limited")
+
+        # Initialize boundary intelligence
+        if BoundaryIntelligence:
+            self.boundary_intelligence = BoundaryIntelligence()
+        else:
+            self.boundary_intelligence = None
+            self.logger.warning("Boundary Intelligence not available")
 
         # Quality thresholds
         self.min_quality_score = 0.85
         self.max_retries = 3
-
-        # Logging
-        self.logger = logging.getLogger(__name__)
 
     def generate(
         self,
@@ -89,7 +120,7 @@ class GenerationEngine:
         ensure_no_artifacts: bool = True
     ) -> GenerationResult:
         """
-        Generate image with specified configuration.
+        Generate image with specified configuration using LiteLLM.
 
         GUARANTEES:
         - No artifacts if ensure_no_artifacts=True
@@ -106,32 +137,43 @@ class GenerationEngine:
         import time
         start_time = time.time()
 
-        # Step 1: Select and use appropriate model
-        image = self._generate_with_model(config)
+        # Step 1: Generate with LiteLLM
+        image = self._generate_with_litellm(config)
 
         # Step 2: Quality assurance
-        if ensure_no_artifacts:
+        if ensure_no_artifacts and image:
             image, auto_fixed = self._ensure_artifact_free(image, config)
         else:
             auto_fixed = False
 
         # Step 3: Final verification
-        quality_score, artifacts_detected = self._verify_quality(image)
+        if image:
+            quality_score, artifacts_detected = self._verify_quality(image)
+        else:
+            quality_score = 0.0
+            artifacts_detected = True
 
         # Step 4: Retry if quality too low
         retry_count = 0
         while quality_score < self.min_quality_score and retry_count < self.max_retries:
             self.logger.warning(f"Quality score {quality_score} below threshold, retrying...")
-            image = self._generate_with_model(config)
-            image, _ = self._ensure_artifact_free(image, config)
-            quality_score, artifacts_detected = self._verify_quality(image)
+            image = self._generate_with_litellm(config)
+            if image:
+                image, _ = self._ensure_artifact_free(image, config)
+                quality_score, artifacts_detected = self._verify_quality(image)
             retry_count += 1
 
         generation_time = time.time() - start_time
 
+        # Create mock image if generation failed
+        if image is None:
+            image = self._create_fallback_image(config)
+            quality_score = 0.5
+            artifacts_detected = True
+
         return GenerationResult(
             image=image,
-            model_used=config.model,
+            model_used=config.litellm_config_name or config.model,
             generation_time=generation_time,
             quality_score=quality_score,
             artifacts_detected=artifacts_detected,
@@ -139,228 +181,106 @@ class GenerationEngine:
             metadata={
                 'config': config.__dict__,
                 'retries': retry_count,
-                'final_size': image.size
+                'final_size': image.size,
+                'litellm_used': LITELLM_AVAILABLE
             }
         )
 
-    def _generate_with_model(self, config: GenerationConfig) -> Image.Image:
+    def _generate_with_litellm(self, config: GenerationConfig) -> Optional[Image.Image]:
         """
-        Generate image using specified model.
+        Generate image using LiteLLM.
 
-        Supports:
-        - flux: FLUX.1 models
-        - sd3.5: Stable Diffusion 3.5
-        - dalle3: DALL-E 3
-        - sdxl: Stable Diffusion XL
-        - mock: Mock generation for testing
+        Supports ALL providers configured in LiteLLM:
+        - Local: Ollama SD, local models
+        - Cloud: DALL-E 3, Replicate (SDXL, FLUX), etc.
         """
-        model = config.model.lower()
+        if not LITELLM_AVAILABLE or not self.litellm:
+            self.logger.error("LiteLLM not available")
+            return None
 
-        if model == "flux":
-            return self._generate_flux(config)
-        elif model == "sd3.5" or model == "sd35":
-            return self._generate_sd35(config)
-        elif model == "dalle3":
-            return self._generate_dalle3(config)
-        elif model == "sdxl":
-            return self._generate_sdxl(config)
-        elif model == "mock":
-            return self._generate_mock(config)
-        else:
-            self.logger.warning(f"Unknown model {model}, falling back to mock")
-            return self._generate_mock(config)
-
-    def _generate_flux(self, config: GenerationConfig) -> Image.Image:
-        """Generate with FLUX model."""
         try:
-            # Try to use diffusers library
-            from diffusers import FluxPipeline
-            import torch
+            # Determine LiteLLM config to use
+            litellm_config = config.litellm_config_name
 
-            if 'flux_pipeline' not in self._model_clients:
-                self._model_clients['flux_pipeline'] = FluxPipeline.from_pretrained(
-                    "black-forest-labs/FLUX.1-dev",
-                    torch_dtype=torch.bfloat16
-                )
-                if torch.cuda.is_available():
-                    self._model_clients['flux_pipeline'].to("cuda")
+            # If no config specified, try to map model to config
+            if not litellm_config:
+                litellm_config = self._map_model_to_litellm_config(config.model)
 
-            pipeline = self._model_clients['flux_pipeline']
+            self.logger.info(f"Generating with LiteLLM config: {litellm_config}")
 
-            image = pipeline(
+            # Map size
+            size = f"{config.width}x{config.height}"
+
+            # Generate using LiteLLM
+            response = self.litellm.generate_image(
                 prompt=config.prompt,
-                height=config.height,
-                width=config.width,
-                num_inference_steps=config.steps,
-                guidance_scale=config.guidance_scale,
-                generator=torch.Generator().manual_seed(config.seed) if config.seed else None
-            ).images[0]
-
-            return image
-
-        except ImportError:
-            self.logger.warning("diffusers not available, using mock generation")
-            return self._generate_mock(config)
-        except Exception as e:
-            self.logger.error(f"FLUX generation failed: {e}, using mock")
-            return self._generate_mock(config)
-
-    def _generate_sd35(self, config: GenerationConfig) -> Image.Image:
-        """Generate with Stable Diffusion 3.5."""
-        try:
-            from diffusers import StableDiffusion3Pipeline
-            import torch
-
-            if 'sd35_pipeline' not in self._model_clients:
-                self._model_clients['sd35_pipeline'] = StableDiffusion3Pipeline.from_pretrained(
-                    "stabilityai/stable-diffusion-3.5-large",
-                    torch_dtype=torch.bfloat16
-                )
-                if torch.cuda.is_available():
-                    self._model_clients['sd35_pipeline'].to("cuda")
-
-            pipeline = self._model_clients['sd35_pipeline']
-
-            image = pipeline(
-                prompt=config.prompt,
-                negative_prompt=config.negative_prompt,
-                height=config.height,
-                width=config.width,
-                num_inference_steps=config.steps,
-                guidance_scale=config.guidance_scale,
-                generator=torch.Generator().manual_seed(config.seed) if config.seed else None
-            ).images[0]
-
-            return image
-
-        except Exception as e:
-            self.logger.error(f"SD3.5 generation failed: {e}, using mock")
-            return self._generate_mock(config)
-
-    def _generate_dalle3(self, config: GenerationConfig) -> Image.Image:
-        """Generate with DALL-E 3 via OpenAI API."""
-        try:
-            import openai
-            import requests
-            from io import BytesIO
-
-            if 'openai' not in self.api_keys:
-                raise ValueError("OpenAI API key not provided")
-
-            client = openai.OpenAI(api_key=self.api_keys['openai'])
-
-            # DALL-E 3 only supports specific sizes
-            size = self._map_to_dalle_size(config.width, config.height)
-
-            response = client.images.generate(
-                model="dall-e-3",
-                prompt=config.prompt,
+                config_name=litellm_config,
                 size=size,
-                quality="hd" if config.quality_mode in ["high", "maximum"] else "standard",
                 n=1
             )
 
-            # Download image
-            image_url = response.data[0].url
-            response = requests.get(image_url)
-            image = Image.open(BytesIO(response.content))
+            # Extract image
+            if not response['images']:
+                self.logger.error("No images in response")
+                return None
 
-            # Resize to exact dimensions if needed
+            img_data = response['images'][0]
+
+            # Download from URL if provided
+            if 'url' in img_data:
+                image_url = img_data['url']
+                self.logger.info(f"Downloading image from URL...")
+                img_response = requests.get(image_url, timeout=30)
+                image = Image.open(io.BytesIO(img_response.content))
+
+            # Or decode from base64
+            elif 'b64_json' in img_data:
+                self.logger.info(f"Decoding base64 image...")
+                img_bytes = base64.b64decode(img_data['b64_json'])
+                image = Image.open(io.BytesIO(img_bytes))
+
+            else:
+                self.logger.error("No URL or b64_json in response")
+                return None
+
+            # Resize if needed
             if image.size != (config.width, config.height):
                 image = image.resize((config.width, config.height), Image.Resampling.LANCZOS)
 
+            self.logger.info(f"Successfully generated image: {image.size}")
             return image
 
         except Exception as e:
-            self.logger.error(f"DALL-E 3 generation failed: {e}, using mock")
-            return self._generate_mock(config)
+            self.logger.error(f"LiteLLM generation failed: {e}")
+            return None
 
-    def _generate_sdxl(self, config: GenerationConfig) -> Image.Image:
-        """Generate with Stable Diffusion XL."""
-        try:
-            from diffusers import StableDiffusionXLPipeline
-            import torch
-
-            if 'sdxl_pipeline' not in self._model_clients:
-                self._model_clients['sdxl_pipeline'] = StableDiffusionXLPipeline.from_pretrained(
-                    "stabilityai/stable-diffusion-xl-base-1.0",
-                    torch_dtype=torch.float16
-                )
-                if torch.cuda.is_available():
-                    self._model_clients['sdxl_pipeline'].to("cuda")
-
-            pipeline = self._model_clients['sdxl_pipeline']
-
-            image = pipeline(
-                prompt=config.prompt,
-                negative_prompt=config.negative_prompt,
-                height=config.height,
-                width=config.width,
-                num_inference_steps=config.steps,
-                guidance_scale=config.guidance_scale,
-                generator=torch.Generator().manual_seed(config.seed) if config.seed else None
-            ).images[0]
-
-            return image
-
-        except Exception as e:
-            self.logger.error(f"SDXL generation failed: {e}, using mock")
-            return self._generate_mock(config)
-
-    def _generate_mock(self, config: GenerationConfig) -> Image.Image:
+    def _map_model_to_litellm_config(self, model: str) -> str:
         """
-        Generate mock image for testing.
+        Map model name to LiteLLM config name.
 
-        Creates a gradient image with text indicating the prompt.
+        Examples:
+        - "dalle3" -> "dalle3"
+        - "flux" -> "replicate_flux"
+        - "sd3.5" -> "replicate_sdxl"
+        - "ollama_sd" -> "ollama_sd"
         """
-        from PIL import ImageDraw, ImageFont
+        model_lower = model.lower()
 
-        # Create gradient background
-        image = Image.new('RGB', (config.width, config.height))
-        draw = ImageDraw.Draw(image)
-
-        # Create gradient
-        for y in range(config.height):
-            color_value = int(255 * (y / config.height))
-            draw.line([(0, y), (config.width, y)], fill=(color_value, 100, 255 - color_value))
-
-        # Add text
-        try:
-            # Try to load a font
-            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 24)
-        except:
-            font = ImageFont.load_default()
-
-        # Word wrap prompt
-        words = config.prompt.split()
-        lines = []
-        current_line = []
-
-        for word in words[:20]:  # Limit to 20 words
-            current_line.append(word)
-            if len(' '.join(current_line)) > 40:  # Wrap at ~40 chars
-                lines.append(' '.join(current_line[:-1]))
-                current_line = [word]
-
-        if current_line:
-            lines.append(' '.join(current_line))
-
-        # Draw text
-        y_text = config.height // 3
-        for line in lines:
-            # Get text size using textbbox
-            bbox = draw.textbbox((0, 0), line, font=font)
-            text_width = bbox[2] - bbox[0]
-            text_height = bbox[3] - bbox[1]
-
-            x_text = (config.width - text_width) // 2
-            draw.text((x_text, y_text), line, fill=(255, 255, 255), font=font)
-            y_text += text_height + 10
-
-        # Add model badge
-        draw.text((10, 10), f"[MOCK - {config.model}]", fill=(255, 255, 0), font=font)
-
-        return image
+        # Direct mappings
+        if model_lower in ['dalle3', 'dalle-3']:
+            return 'dalle3'
+        elif model_lower in ['ollama_sd', 'ollama-sd']:
+            return 'ollama_sd'
+        elif model_lower in ['flux']:
+            return 'replicate_flux' if 'replicate_flux' in self.litellm.image_configs else 'ollama_sd'
+        elif model_lower in ['sdxl', 'sd3.5', 'sd35']:
+            return 'replicate_sdxl' if 'replicate_sdxl' in self.litellm.image_configs else 'ollama_sd'
+        else:
+            # Try to use the model name directly as config name
+            if model in self.litellm.image_configs:
+                return model
+            # Fallback to default
+            return self.litellm.default_image_gen
 
     def _ensure_artifact_free(
         self,
@@ -368,7 +288,7 @@ class GenerationEngine:
         config: GenerationConfig
     ) -> Tuple[Image.Image, bool]:
         """
-        Ensure image has no artifacts.
+        Ensure image has no artifacts using Boundary Intelligence.
 
         Uses BoundaryIntelligence to detect and fix:
         - Cutoffs
@@ -377,6 +297,9 @@ class GenerationEngine:
 
         Returns: (fixed_image, was_fixed)
         """
+        if not self.boundary_intelligence:
+            return image, False
+
         # Analyze for artifacts
         analysis = self.boundary_intelligence.analyze_boundaries(image)
 
@@ -406,6 +329,23 @@ class GenerationEngine:
 
         Returns: (quality_score, has_artifacts)
         """
+        if not self.boundary_intelligence:
+            # Basic quality check without boundary intelligence
+            img_array = np.array(image)
+            quality_score = 0.7  # Default
+
+            # Check for all-black or all-white
+            mean_value = np.mean(img_array)
+            if mean_value < 10 or mean_value > 245:
+                quality_score = 0.3
+
+            # Check variance
+            variance = np.var(img_array)
+            if variance < 100:
+                quality_score = 0.4
+
+            return quality_score, False
+
         # Check for artifacts
         analysis = self.boundary_intelligence.analyze_boundaries(image)
 
@@ -443,17 +383,55 @@ class GenerationEngine:
 
         return quality_score, has_artifacts
 
-    def _map_to_dalle_size(self, width: int, height: int) -> str:
-        """Map dimensions to DALL-E 3 supported sizes."""
-        # DALL-E 3 supports: 1024x1024, 1792x1024, 1024x1792
-        aspect = width / height
+    def _create_fallback_image(self, config: GenerationConfig) -> Image.Image:
+        """
+        Create fallback image if generation fails.
+        """
+        from PIL import ImageDraw, ImageFont
 
-        if abs(aspect - 1.0) < 0.1:
-            return "1024x1024"
-        elif aspect > 1.3:
-            return "1792x1024"
-        else:
-            return "1024x1792"
+        # Create gradient background
+        image = Image.new('RGB', (config.width, config.height))
+        draw = ImageDraw.Draw(image)
+
+        # Create gradient
+        for y in range(config.height):
+            color_value = int(255 * (y / config.height))
+            draw.line([(0, y), (config.width, y)], fill=(color_value, 100, 255 - color_value))
+
+        # Add text
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 24)
+        except:
+            font = ImageFont.load_default()
+
+        # Word wrap prompt
+        words = config.prompt.split()[:20]
+        lines = []
+        current_line = []
+
+        for word in words:
+            current_line.append(word)
+            if len(' '.join(current_line)) > 40:
+                lines.append(' '.join(current_line[:-1]))
+                current_line = [word]
+
+        if current_line:
+            lines.append(' '.join(current_line))
+
+        # Draw text
+        y_text = config.height // 3
+        for line in lines:
+            bbox = draw.textbbox((0, 0), line, font=font)
+            text_width = bbox[2] - bbox[0]
+            text_height = bbox[3] - bbox[1]
+            x_text = (config.width - text_width) // 2
+            draw.text((x_text, y_text), line, fill=(255, 255, 255), font=font)
+            y_text += text_height + 10
+
+        # Add fallback badge
+        draw.text((10, 10), "[FALLBACK - Generation Failed]", fill=(255, 0, 0), font=font)
+
+        return image
 
     def batch_generate(
         self,
@@ -473,7 +451,7 @@ class GenerationEngine:
         results = []
 
         if parallel:
-            # Parallel generation (if supported)
+            # Parallel generation
             try:
                 from concurrent.futures import ThreadPoolExecutor
 
@@ -489,33 +467,8 @@ class GenerationEngine:
 
         return results
 
-    def generate_with_controlnet(
-        self,
-        prompt: str,
-        control_image: Image.Image,
-        control_type: str = "canny",
-        **kwargs
-    ) -> GenerationResult:
-        """
-        Generate with ControlNet for precise control.
-
-        Args:
-            prompt: Text prompt
-            control_image: Control image (edges, depth, pose, etc.)
-            control_type: Type of control ("canny", "depth", "pose", etc.)
-            **kwargs: Additional generation parameters
-
-        Returns:
-            GenerationResult
-        """
-        config = GenerationConfig(
-            model="sdxl",  # Default to SDXL with ControlNet
-            prompt=prompt,
-            control_type=control_type,
-            control_image=control_image,
-            **kwargs
-        )
-
-        # ControlNet-specific generation would go here
-        # For now, use standard generation
-        return self.generate(config)
+    def get_available_models(self) -> List[str]:
+        """Get list of available image generation models via LiteLLM"""
+        if not self.litellm:
+            return []
+        return list(self.litellm.image_configs.keys())
